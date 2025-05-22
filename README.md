@@ -43,7 +43,7 @@ The application is built using Tkinter for the GUI and can optionally use `spiff
     * **Save Highest Energy Geometry:** Save the coordinates of the highest energy frame as a new `.xyz` file.
     * **Plot Profile:** Generates an energy profile (Energy vs. Frame Number) for the loaded `.allxyz` file using `spiffyplot` with customizable color.
     * **Clipboard Functionality:** Copy the frame table to the clipboard in TSV format.
-* **Tab 3: Orbital Analysis**
+* **Tab 3: Orbital Analysis**(in next version)
     * **HOMO/LUMO Display:** For the currently selected file (from Tab 1), displays HOMO energy, LUMO energy, and the HOMO-LUMO gap in both Hartrees (Eh) and electron Volts (eV).
     * **HOMO/LUMO Plotting:**
         * Generates a plot showing HOMO and LUMO energy levels (in eV) for all successfully parsed loaded files.
