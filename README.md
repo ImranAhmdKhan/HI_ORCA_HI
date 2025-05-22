@@ -141,5 +141,6 @@ The application is built using Tkinter for the GUI and can optionally use `spiff
 * **UnicodeDecodeError:** If you encounter this error when loading files, it means the file encoding is not standard UTF-8 or Latin-1. The script tries these two, but some ORCA outputs might have unusual characters.
 * **Spiffyplot Not Found:** If `spiffyplot` is not installed or not in your PATH, plotting buttons will be disabled or will show an error.
 * **Parsing Failures:** ORCA output formats can vary slightly. While the parsing logic tries to be robust, some files might not parse correctly, especially for orbital energies if they deviate significantly from common output patterns. Check the console for warnings.
+![image](https://github.com/user-attachments/assets/77407a82-92b0-4fb6-bc85-f69d59ba41c4)
 
 This README provides a comprehensive guide to your application. Let me know if you'd like any adjustments or further details added!
