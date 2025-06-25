@@ -1,0 +1,620 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os
+import re
+import math # For exp in Curtin-Hammett
+import numpy as np # For HOMO-LUMO plotting positions
+import importlib 
+import importlib.util # For dynamic module loading
+import sys # To add modules directory to path
+
+# Try to import matplotlib
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator # For better integer ticks on x-axis if needed
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg 
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    FigureCanvasTkAgg = None 
+
+# --- Conversion Factors (Accessible to modules via self.app.FACTOR_NAME) ---
+HARTREE_TO_KCAL_PER_MOL = 627.50960803
+HARTREE_TO_KJ_PER_MOL = 2625.49963948
+HARTREE_TO_EV = 27.21139664
+HARTREE_TO_J = 4.3597447222071e-18
+AVOGADRO_CONSTANT = 6.02214076e23
+J_PER_MOL_K_FROM_HARTREE_PER_K = HARTREE_TO_J * AVOGADRO_CONSTANT
+CAL_PER_MOL_K_FROM_J_PER_MOL_K = 1 / 4.184
+R_KCAL_MOL_K = 1.987204259e-3 # kcal/mol·K
+
+def _parse_orca_frequencies(file_content):
+    """
+    Parses the 'VIBRATIONAL FREQUENCIES' section of an ORCA output.
+    Returns a list of tuples: (wavenumber_cm-1, IR_intensity_KM/mol)
+    or an empty list if not found or parsing fails.
+    """
+    frequencies_data = []
+    try:
+        freq_block_match = re.search(
+            r"VIBRATIONAL FREQUENCIES\n-+\n([\s\S]*?)(?=\n\n|\n\s*NORMAL MODES|\n\s*IR SPECTRUM|\n\s*THERMOCHEMISTRY AT|\Z)", 
+            file_content
+        )
+        if freq_block_match:
+            block_content = freq_block_match.group(1)
+            line_regex = re.compile(r"^\s*(\d+):\s*(-?[\d\.]+)\s*cm\*\*-1\s*\(.*?IR:\s*([\d\.]+)\)")
+            for line in block_content.splitlines():
+                match = line_regex.search(line)
+                if match:
+                    try:
+                        wavenumber_str = match.group(2)
+                        ir_intensity_str = match.group(3)
+                        wavenumber = float(wavenumber_str)
+                        ir_intensity = float(ir_intensity_str)
+                        frequencies_data.append((wavenumber, ir_intensity))
+                    except ValueError as e:
+                        print(f"Warning: Could not parse frequency/intensity from line: '{line.strip()}' -> {e}")
+                        continue
+    except Exception as e:
+        print(f"Error during frequency parsing: {e}")
+    
+    if not frequencies_data:
+        pass
+    return frequencies_data
+
+
+def parse_orca_thermo_block(filepath, app_instance=None):
+    """
+    Parses ORCA output file for thermochemistry and attempts to parse HOMO-LUMO and Frequency data.
+    """
+    thermo_data = {
+        "temperature_k": None, "electronic_energy_eh": None, "zero_point_energy_eh": None,
+        "thermal_vibrational_correction_eh": None, "thermal_rotational_correction_eh": None,
+        "thermal_translational_correction_eh": None, "total_inner_energy_u_eh": None,
+        "thermal_enthalpy_correction_eh": None, "total_enthalpy_h_eh": None,
+        "ts_electronic_eh": None, "ts_vibrational_eh": None, "ts_rotational_eh": None,
+        "ts_translational_eh": None, "final_ts_term_eh": None,
+        "final_gibbs_free_energy_g_eh": None, "g_minus_eel_eh": None,
+        "total_thermal_correction_to_e_eh": None, "total_correction_to_e_eh": None,
+        "source_info": f"Not Parsed ({os.path.basename(filepath)})", "filepath": filepath,
+        "homo_ev": None, "lumo_ev": None, "gap_ev": None,
+        "frequencies": [] 
+    }
+    patterns = {
+        "temperature_k": re.compile(r"THERMOCHEMISTRY AT\s+([\d\.]+)\s*K"),
+        "electronic_energy_eh": re.compile(r"Electronic energy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "zero_point_energy_eh": re.compile(r"Zero point energy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "thermal_vibrational_correction_eh": re.compile(r"Thermal vibrational correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "thermal_rotational_correction_eh": re.compile(r"Thermal rotational correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "thermal_translational_correction_eh": re.compile(r"Thermal translational correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "total_inner_energy_u_eh": re.compile(r"Total thermal energy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "total_thermal_correction_to_e_eh": re.compile(r"Total thermal correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "total_correction_to_e_eh": re.compile(r"Total correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "thermal_enthalpy_correction_eh": re.compile(r"Thermal Enthalpy correction\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "total_enthalpy_h_eh": re.compile(r"Total Enthalpy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "ts_electronic_eh": re.compile(r"Electronic entropy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "ts_vibrational_eh": re.compile(r"Vibrational entropy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "ts_rotational_eh": re.compile(r"Rotational entropy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "ts_translational_eh": re.compile(r"Translational entropy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "final_ts_term_eh": re.compile(r"Final entropy term\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "final_gibbs_free_energy_g_eh": re.compile(r"Final Gibbs free energy\s+\.+\s+(-?[\d\.]+)\s*Eh"),
+        "g_minus_eel_eh": re.compile(r"G-E\(el\)\s+\.+\s+(-?[\d\.]+)\s*Eh")
+    }
+    found_thermo_block_start = False; parsed_from_thermo_block = False
+    file_content = "" 
+
+    try:
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f: file_content = f.read()
+        except UnicodeDecodeError:
+            print(f"Warning: UTF-8 decoding failed for {os.path.basename(filepath)}. Trying latin-1.")
+            with open(filepath, 'r', encoding='latin-1') as f: file_content = f.read()
+        
+        lines = file_content.splitlines()
+
+        for i, line in enumerate(lines):
+            if not found_thermo_block_start:
+                temp_match = patterns["temperature_k"].search(line)
+                if temp_match:
+                    thermo_data["temperature_k"] = float(temp_match.group(1)); found_thermo_block_start = True
+                    parsed_from_thermo_block = True; thermo_data["source_info"] = f"Full Thermo ({os.path.basename(filepath)})"; continue
+            if found_thermo_block_start:
+                if thermo_data.get("total_inner_energy_u_eh") is None:
+                    inner_e_match = re.search(r"Inner energy\s+\.+\s+(-?[\d\.]+)\s*Eh", line)
+                    if inner_e_match:
+                        thermo_data["total_inner_energy_u_eh"] = float(inner_e_match.group(1))
+                for key, pattern in patterns.items():
+                    if key == "temperature_k": continue
+                    match = pattern.search(line)
+                    if match:
+                        try: thermo_data[key] = float(match.group(1))
+                        except ValueError: pass 
+                if "G-E(el)" in line and thermo_data["g_minus_eel_eh"] is not None:
+                    look_ahead_lines = lines[i+1 : i+6]; 
+                    if any("SUGGESTED CITATIONS" in nl for nl in look_ahead_lines) or \
+                       any("Timings for individual modules" in nl for nl in look_ahead_lines) or \
+                       any("Total run time" in nl for nl in look_ahead_lines):
+                        break 
+        
+        if not parsed_from_thermo_block or thermo_data.get("total_inner_energy_u_eh") is None :
+            xyz_filepath = os.path.splitext(filepath)[0] + ".xyz"; xyz_energy_parsed = False
+            if os.path.exists(xyz_filepath):
+                xyz_lines = []
+                try:
+                    try:
+                        with open(xyz_filepath, 'r', encoding='utf-8') as xyz_f: xyz_lines = xyz_f.readlines()
+                    except UnicodeDecodeError:
+                        with open(xyz_filepath, 'r', encoding='latin-1') as xyz_f: xyz_lines = xyz_f.readlines()
+                    if len(xyz_lines) >= 2:
+                        comment_line = xyz_lines[1].strip()
+                        energy_match = re.search(r"(?:Energy|E|energy|E\(SCF\)|SCF)\s*=?\s*(-?\d+\.?\d*(?:[eE][-+]?\d+)?)", comment_line, re.IGNORECASE)
+                        if energy_match:
+                            xyz_energy = float(energy_match.group(1))
+                            if not parsed_from_thermo_block:
+                                thermo_data["electronic_energy_eh"] = xyz_energy
+                                thermo_data["source_info"] = f"XYZ Comment ({os.path.basename(xyz_filepath)})"; xyz_energy_parsed = True
+                            elif thermo_data.get("electronic_energy_eh") is None:
+                                thermo_data["electronic_energy_eh"] = xyz_energy
+                                print(f"Note: Used E_el from XYZ for incomplete thermo block of {os.path.basename(filepath)}")
+                                xyz_energy_parsed = True
+                except Exception as e_xyz: print(f"Warning: Could not parse XYZ {xyz_filepath}: {e_xyz}")
+            
+            if not parsed_from_thermo_block and not xyz_energy_parsed: 
+                if not filepath.lower().endswith(".xyz"): pass 
+                else: 
+                    if not (filepath.lower().endswith(".out") or filepath.lower().endswith(".log")):
+                        return None 
+            elif parsed_from_thermo_block and thermo_data.get("total_inner_energy_u_eh") is None and thermo_data.get("electronic_energy_eh") is None:
+                 messagebox.showwarning("Parsing Warning", f"Incomplete thermochemistry block in '{os.path.basename(filepath)}' and no E_el. Some values may be missing or N/A.")
+            elif parsed_from_thermo_block and thermo_data.get("total_inner_energy_u_eh") is None:
+                 print(f"Note: Incomplete thermochemistry block in '{os.path.basename(filepath)}'. Some values may be missing.")
+        
+        if app_instance and hasattr(app_instance, '_parse_orca_for_homo_lumo') and \
+           file_content and (filepath.lower().endswith(".out") or filepath.lower().endswith(".log")):
+            homo_ev, lumo_ev = app_instance._parse_orca_for_homo_lumo(filepath, file_content=file_content) 
+            if homo_ev is not None and lumo_ev is not None:
+                thermo_data["homo_ev"], thermo_data["lumo_ev"], thermo_data["gap_ev"] = homo_ev, lumo_ev, lumo_ev - homo_ev
+                if "Not Parsed" in thermo_data["source_info"] and not parsed_from_thermo_block and not xyz_energy_parsed:
+                    thermo_data["source_info"] = f"HOMO-LUMO only ({os.path.basename(filepath)})"
+                elif "Not Parsed" not in thermo_data["source_info"]:
+                     thermo_data["source_info"] += ", H/L Parsed"
+        
+        if file_content and (filepath.lower().endswith(".out") or filepath.lower().endswith(".log")):
+            frequencies = _parse_orca_frequencies(file_content) 
+            if frequencies:
+                thermo_data["frequencies"] = frequencies
+                if "Not Parsed" in thermo_data["source_info"] and not parsed_from_thermo_block and not xyz_energy_parsed and thermo_data["homo_ev"] is None:
+                    thermo_data["source_info"] = f"IR Freq. only ({os.path.basename(filepath)})"
+                elif "Not Parsed" not in thermo_data["source_info"]:
+                    thermo_data["source_info"] += ", IR Parsed"
+
+
+    except FileNotFoundError: messagebox.showerror("Error", f"File not found: {filepath}"); return None
+    except Exception as e: messagebox.showerror("Error", f"Error parsing '{os.path.basename(filepath)}':\n{e}"); import traceback; traceback.print_exc(); return None
+    
+    if thermo_data["electronic_energy_eh"] is None and \
+       thermo_data["homo_ev"] is None and \
+       not thermo_data["frequencies"] and \
+       "Not Parsed" in thermo_data["source_info"]: 
+        if not filepath.lower().endswith(".xyz"):
+            messagebox.showinfo("Parsing Info", f"No relevant data (thermo, XYZ energy, HOMO-LUMO, or Frequencies) found in '{os.path.basename(filepath)}'.")
+        return None
+        
+    return thermo_data
+
+
+def parse_multiframe_xyz(filepath):
+    frames_data = []
+    lines = []
+    try:
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f: lines = f.readlines()
+        except UnicodeDecodeError:
+            print(f"Warning: UTF-8 decoding failed for multi-frame XYZ {os.path.basename(filepath)}. Trying latin-1.")
+            with open(filepath, 'r', encoding='latin-1') as f: lines = f.readlines()
+
+        idx = 0; frame_index = 0
+        while idx < len(lines):
+            try:
+                num_atoms_str = lines[idx].strip(); 
+                if not num_atoms_str: idx += 1; continue 
+                num_atoms = int(num_atoms_str); idx += 1
+                if idx + num_atoms + 1 > len(lines) +1 : break 
+                comment_line = lines[idx].strip(); idx += 1
+                coordinates = [lines[idx+k].strip() for k in range(num_atoms)]; idx += num_atoms
+                energy_eh = None
+                energy_match = re.search(r"(?:Energy|E|energy|E\(SCF\)|SCF)\s*=?\s*(-?\d+\.?\d*(?:[eE][-+]?\d+)?)", comment_line, re.IGNORECASE)
+                if energy_match:
+                    try: energy_eh = float(energy_match.group(1))
+                    except ValueError: pass
+                frames_data.append({'frame_index': frame_index, 'num_atoms': num_atoms, 'comment_line': comment_line, 
+                                    'energy_eh': energy_eh, 'coordinates': coordinates, 'filepath': filepath})
+                frame_index += 1
+            except ValueError: print(f"Warning: Skipping invalid frame in {os.path.basename(filepath)} near line {idx+1}."); break 
+            except IndexError: print(f"Warning: File {os.path.basename(filepath)} ended unexpectedly during frame parsing."); break
+    except FileNotFoundError: messagebox.showerror("Error", f"File not found: {filepath}"); return None
+    except Exception as e: messagebox.showerror("Error", f"Error reading {os.path.basename(filepath)}: {e}"); return None
+    if not frames_data: messagebox.showinfo("Parsing Info", f"No XYZ frames in {os.path.basename(filepath)}."); return []
+    return frames_data
+
+
+class ThermoApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Hi_ORCA/Jaguar Thermo, TS, & IR Tools - Modular") 
+        master.geometry("1350x950") 
+
+        self.loaded_file_paths = [] 
+        self.loaded_files_data = {} 
+        self.gui_modules = [] 
+
+        self.show_eh_var = tk.BooleanVar(value=True); self.show_kcal_var = tk.BooleanVar(value=True)
+        self.show_kj_var = tk.BooleanVar(value=True); self.show_ev_var = tk.BooleanVar(value=True)
+        self.show_general_var = tk.BooleanVar(value=True); self.show_inner_energy_var = tk.BooleanVar(value=True)
+        self.show_corrections_var = tk.BooleanVar(value=True); self.show_enthalpy_var = tk.BooleanVar(value=True)
+        self.show_ts_terms_var = tk.BooleanVar(value=True); self.show_s_total_var = tk.BooleanVar(value=True)
+        self.show_gibbs_var = tk.BooleanVar(value=True)
+        
+        self.HARTREE_TO_KCAL_PER_MOL = HARTREE_TO_KCAL_PER_MOL
+        self.HARTREE_TO_KJ_PER_MOL = HARTREE_TO_KJ_PER_MOL
+        self.HARTREE_TO_EV = HARTREE_TO_EV
+        self.J_PER_MOL_K_FROM_HARTREE_PER_K = J_PER_MOL_K_FROM_HARTREE_PER_K
+        self.CAL_PER_MOL_K_FROM_J_PER_MOL_K = CAL_PER_MOL_K_FROM_J_PER_MOL_K
+        self.R_KCAL_MOL_K = R_KCAL_MOL_K
+        self.MATPLOTLIB_AVAILABLE = MATPLOTLIB_AVAILABLE 
+        self.FigureCanvasTkAgg = FigureCanvasTkAgg     
+
+        self.row_tags = ('evenrow', 'oddrow')
+        self.line_styles = ['-', '--', '-.', ':'] 
+        self.plot_colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black', 'purple', 'orange', 'brown', 'dodgerblue', 'teal', 'lime', 'pink']
+
+        style = ttk.Style(master)
+        style.configure("Treeview.Heading", font=('Calibri', 10, 'bold'))
+        style.map('Treeview', background=[('selected', "#FFFFFF")])
+        
+        self.hl_font_family = "Arial"; self.hl_title_font_size = 14
+        self.hl_label_font_size = 11; self.hl_button_font_size = 10
+        self.hl_listbox_font_size = 10; self.hl_bg_color = "white" 
+        self.hl_button_color = "#28a745"; self.hl_clear_button_color = "#ffc107" 
+        self.hl_button_text_color = "white"; self.hl_text_color = "#333333"
+        style.configure('HL.TFrame', background=self.hl_bg_color) 
+
+        self.notebook = ttk.Notebook(master)
+        self.notebook.pack(expand=True, fill='both', padx=5, pady=5)
+
+        self._load_gui_modules()
+
+    def _load_gui_modules(self):
+        modules_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
+        if not os.path.isdir(modules_dir):
+            print(f"Modules directory not found: {modules_dir}")
+            self._create_fallback_info_tab("Modules directory missing or not named 'modules'.")
+            return
+
+        if modules_dir not in sys.path:
+            sys.path.insert(0, modules_dir)
+
+        module_load_order = {
+            "thermo_analyzer_module": "ThermoAnalyzerModule",
+            "allxyz_analyzer_module": "AllxyzAnalyzerModule",
+            "homo_lumo_analyzer_module": "HomoLumoAnalyzerModule",
+            "ir_viewer_module": "IRViewerModule", 
+            "jaguar_analyzer_module": "JaguarAnalyzerModule", # Added Jaguar module
+        }
+        
+        found_any_module = False
+        for module_name_py, class_name in module_load_order.items():
+            module_file_path = os.path.join(modules_dir, module_name_py + ".py")
+            if os.path.exists(module_file_path):
+                try:
+                    module_spec = importlib.util.spec_from_file_location(module_name_py, module_file_path)
+                    if module_spec is None or module_spec.loader is None:
+                        print(f"Could not create module spec or loader for {module_file_path}. Skipping.")
+                        continue
+                    
+                    imported_module = importlib.util.module_from_spec(module_spec)
+                    sys.modules[module_name_py] = imported_module 
+                    module_spec.loader.exec_module(imported_module)
+                    
+                    if hasattr(imported_module, class_name):
+                        ModuleClass = getattr(imported_module, class_name)
+                        module_instance = ModuleClass(self) 
+                        
+                        tab_name = class_name 
+                        if hasattr(module_instance, "get_tab_name"):
+                            tab_name = module_instance.get_tab_name()
+                        
+                        tab_frame = ttk.Frame(self.notebook, padding=5)
+                        tab_style = None
+                        if hasattr(module_instance, "get_tab_style_name"):
+                            tab_style = module_instance.get_tab_style_name()
+                        if tab_style:
+                             tab_frame.configure(style=tab_style)
+                        
+                        self.notebook.add(tab_frame, text=tab_name)
+                        
+                        if hasattr(module_instance, "setup_ui"):
+                            module_instance.setup_ui(tab_frame)
+                            found_any_module = True
+                        else:
+                            tk.Label(tab_frame, text=f"Module '{tab_name}' is missing setup_ui method.").pack()
+                            
+                        self.gui_modules.append(module_instance)
+                        print(f"Successfully loaded module: {tab_name} from {module_name_py}.py")
+                    else:
+                        print(f"Class '{class_name}' not found in {module_name_py}.py")
+                except Exception as e:
+                    print(f"Error loading module {module_name_py}.py: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                 print(f"Module file not found: {module_file_path} (specified in module_load_order for {module_name_py})")
+        
+        if not found_any_module:
+            self._create_fallback_info_tab("No modules loaded. Check 'modules' folder and console output.")
+
+    def _create_fallback_info_tab(self, message):
+        print(message)
+        info_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(info_tab, text="Information")
+        tk.Label(info_tab, text=message, wraplength=400).pack(padx=10, pady=10)
+
+    def load_files(self):
+        filepaths_tuple = filedialog.askopenfilenames(
+            title="Select ORCA Output File(s) (.out/.log/.xyz)",
+            filetypes=(("ORCA/XYZ files", "*.out *.log *.xyz"), ("Jaguar files", "*.out"), ("All files", "*.*")) # Added Jaguar .out
+        )
+        if not filepaths_tuple: return
+
+        current_selection_path_in_first_module = None
+        if self.gui_modules and hasattr(self.gui_modules[0], 'file_listbox') and self.gui_modules[0].file_listbox:
+            active_listbox = self.gui_modules[0].file_listbox 
+            if active_listbox.curselection():
+                try:
+                    selected_text = active_listbox.get(active_listbox.curselection()[0])
+                    selected_basename = os.path.basename(selected_text.split(' (')[0]) 
+                    for pth in self.loaded_file_paths:
+                        if os.path.basename(pth) == selected_basename:
+                            current_selection_path_in_first_module = pth; break
+                except Exception as e: print(f"Error getting current selection: {e}")
+
+
+        newly_added_paths_for_this_load = []
+        for filepath in filepaths_tuple:
+            if filepath not in self.loaded_file_paths:
+                self.loaded_file_paths.append(filepath) 
+                newly_added_paths_for_this_load.append(filepath)
+            
+            # For now, ORCA parser is the main one. Jaguar module handles its own parsing.
+            # If a more generic dispatcher is needed, this logic would change.
+            if filepath.lower().endswith((".log", ".xyz")) or "orca" in filepath.lower() : # Heuristic for ORCA files
+                parsed_data = parse_orca_thermo_block(filepath, app_instance=self)
+            else: # Assume it could be Jaguar or other, let modules handle specific parsing if needed
+                parsed_data = {"filepath": filepath, "source_info": f"Generic load ({os.path.basename(filepath)})"} 
+                # Modules can later try to parse it more specifically if they recognize it.
+
+            if parsed_data: # Even if generic, store the filepath
+                self.loaded_files_data[filepath] = parsed_data
+            else: # Full parsing failure by primary parser
+                if filepath in self.loaded_files_data: del self.loaded_files_data[filepath]
+                print(f"Warning: Primary parsing failed or no relevant data for {os.path.basename(filepath)}.")
+        
+        path_to_reselect = None
+        if newly_added_paths_for_this_load: path_to_reselect = newly_added_paths_for_this_load[0]
+        elif current_selection_path_in_first_module and current_selection_path_in_first_module in self.loaded_file_paths:
+            path_to_reselect = current_selection_path_in_first_module
+        elif self.loaded_file_paths: path_to_reselect = self.loaded_file_paths[0]
+
+        for module in self.gui_modules:
+            if hasattr(module, 'update_file_list_display'):
+                module.update_file_list_display(select_path=path_to_reselect)
+            if module == self.gui_modules[0] and hasattr(module, 'on_file_select_from_listbox') and path_to_reselect:
+                 if hasattr(module, 'file_listbox') and module.file_listbox and module.file_listbox.size() > 0:
+                    module.on_file_select_from_listbox() 
+            if hasattr(module, "_setup_initial_homo_lumo_plot"): module._setup_initial_homo_lumo_plot()
+            if hasattr(module, "_setup_initial_ir_plot"): module._setup_initial_ir_plot()
+
+
+    def move_file_in_list(self, direction, listbox_widget_from_module, module_instance):
+        selected_indices = listbox_widget_from_module.curselection()
+        if not selected_indices:
+            messagebox.showinfo("Reorder Info", "Please select a file in the list to move.", parent=self.master); return
+        
+        current_listbox_idx = selected_indices[0]
+        selected_item_text = listbox_widget_from_module.get(current_listbox_idx)
+        path_to_move_basename = os.path.basename(selected_item_text.split(' (')[0]) 
+        
+        current_main_list_idx = -1
+        for idx, pth in enumerate(self.loaded_file_paths):
+            if os.path.basename(pth) == path_to_move_basename:
+                current_main_list_idx = idx; break
+        
+        if current_main_list_idx == -1:
+            messagebox.showerror("Reorder Error", "Could not find the selected file in the main list.", parent=self.master); return
+
+        if direction == "up":
+            if current_main_list_idx == 0: return
+            new_main_list_idx = current_main_list_idx - 1
+        elif direction == "down":
+            if current_main_list_idx == len(self.loaded_file_paths) - 1: return
+            new_main_list_idx = current_main_list_idx + 1
+        else: return
+
+        path_to_move_full = self.loaded_file_paths.pop(current_main_list_idx)
+        self.loaded_file_paths.insert(new_main_list_idx, path_to_move_full)
+        
+        for mod in self.gui_modules:
+            if hasattr(mod, 'update_file_list_display'):
+                mod.update_file_list_display(select_path=path_to_move_full)
+            if mod == module_instance and hasattr(mod, 'on_file_select_from_listbox'):
+                 if hasattr(mod, 'file_listbox') and mod.file_listbox and mod.file_listbox.size() > 0:
+                    mod.on_file_select_from_listbox()
+
+    def _get_relevant_energy(self, data_dict, energy_type_priority=['G', 'H', 'E_el+ZPE', 'E_el']):
+        if not data_dict: return None, "N/A", None
+        temp_k = data_dict.get("temperature_k", 298.15) 
+        if temp_k is None: temp_k = 298.15 
+
+        for etype in energy_type_priority:
+            if etype == 'G' and data_dict.get("final_gibbs_free_energy_g_eh") is not None:
+                return data_dict["final_gibbs_free_energy_g_eh"], "G", temp_k
+            if etype == 'H' and data_dict.get("total_enthalpy_h_eh") is not None:
+                return data_dict["total_enthalpy_h_eh"], "H", temp_k
+            if etype == 'E_el+ZPE' and data_dict.get("electronic_energy_eh") is not None and data_dict.get("zero_point_energy_eh") is not None:
+                return data_dict["electronic_energy_eh"] + data_dict["zero_point_energy_eh"], "E+ZPE", temp_k
+            if etype == 'E_el' and data_dict.get("electronic_energy_eh") is not None:
+                return data_dict["electronic_energy_eh"], "E_el", temp_k
+        return None, "N/A", temp_k
+
+    def _get_s_and_ts(self, data_dict):
+        if data_dict and data_dict.get("final_ts_term_eh") is not None and data_dict.get("temperature_k") is not None:
+            ts_eh = data_dict["final_ts_term_eh"]; temp = data_dict["temperature_k"]
+            if temp is not None and temp > 0: return ts_eh / temp, ts_eh, temp
+        default_temp = data_dict.get("temperature_k", 298.15)
+        if default_temp is None: default_temp = 298.15
+        return None, None, default_temp
+
+    def _get_energy_key_for_plot(self, requested_type_str, data_dict):
+        if not data_dict: return None
+        if requested_type_str == "Gibbs Free Energy (G)": return "final_gibbs_free_energy_g_eh"
+        if requested_type_str == "Enthalpy (H)": return "total_enthalpy_h_eh"
+        if requested_type_str == "E_el + ZPVE":
+            if data_dict.get("electronic_energy_eh") is not None and data_dict.get("zero_point_energy_eh") is not None:
+                return "_e_plus_zpe_calculated" 
+            return "electronic_energy_eh" 
+        if requested_type_str == "Electronic Energy (E_el)": return "electronic_energy_eh"
+        return "electronic_energy_eh" 
+
+    def _parse_orca_for_homo_lumo(self, filepath, file_content=None):
+        homo_ev, lumo_ev = None, None; energies = [] 
+        if file_content is None: 
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(filepath, 'r', encoding='latin-1') as f: content = f.read()
+                except Exception as e: print(f"Error reading file {filepath} for H/L: {e}"); return None, None
+            except Exception as e: print(f"Error reading file {filepath} for H/L: {e}"); return None, None
+        else: content = file_content
+        orbital_regex = re.compile(r"^\s*\d+\s+(\d+\.\d+)\s+([-\d\.eE+]+)\s+([-\d\.eE+]+)")
+        orbital_section_regex = re.compile(r"ORBITAL ENERGIES\s*-+\s*NO\s+OCC\s+E\(Eh\)\s+E\(eV\)\s*-*\s*([\s\S]*?)(?:\n\n|\n\s*---|\Z)", re.MULTILINE)
+        match = orbital_section_regex.search(content)
+        section_content = ""
+        if not match:
+            orbital_section_regex_simple = re.compile(r"ORBITAL ENERGIES\s*-+\s*([\s\S]*?)(?:\n\n|\n\s*---|\Z)", re.MULTILINE)
+            match_simple = orbital_section_regex_simple.search(content)
+            if match_simple: section_content = match_simple.group(1)
+            else: return None, None 
+        else: section_content = match.group(1)
+        lines = section_content.strip().split('\n')
+        for line in lines:
+            m = orbital_regex.match(line.strip())
+            if m:
+                try:
+                    occupation = float(m.group(1)); energy_ev = float(m.group(3)) 
+                    energies.append((occupation, energy_ev))
+                except ValueError: continue
+        if not energies: return None, None
+        occupied_orbitals = [e for e in energies if e[0] > 0.01]; unoccupied_orbitals = [e for e in energies if e[0] < 0.01]
+        if occupied_orbitals: homo_ev = max(occupied_orbitals, key=lambda x: x[1])[1]
+        if unoccupied_orbitals: lumo_ev = min(unoccupied_orbitals, key=lambda x: x[1])[1]
+        if homo_ev is None or lumo_ev is None: 
+            last_occupied_idx = -1
+            for i, (occ, _) in enumerate(energies):
+                if occ > 0.01: last_occupied_idx = i
+                else: 
+                    if last_occupied_idx != -1 and i < len(energies):
+                        homo_ev = energies[last_occupied_idx][1]; lumo_ev = energies[i][1]; break
+            if homo_ev is None or lumo_ev is None: return None, None
+        return homo_ev, lumo_ev
+
+    def _plot_profile_matplotlib(self, x_coords, y_values_kcal, x_labels, y_label_main, title_text, 
+                                 ref_label_for_plot, types_plotted_for_annotations, 
+                                 enable_break, break_from_str, break_to_str, 
+                                 line_style, line_width_str, line_color, 
+                                 is_allxyz_plot=False):
+        if not self.MATPLOTLIB_AVAILABLE: messagebox.showerror("Plot Error", "Matplotlib library is not installed."); return
+        fig = None; ax_main = None; ax_top = None  
+        try: line_width = float(line_width_str)
+        except ValueError: messagebox.showerror("Plot Error", f"Invalid line width: '{line_width_str}'.", parent=self.master); return
+        try:
+            break_from_val = float(break_from_str) if enable_break and break_from_str else None
+            break_to_val = float(break_to_str) if enable_break and break_to_str else None
+        except ValueError: messagebox.showerror("Plot Error", "Invalid axis break values.", parent=self.master); return
+
+        if enable_break and break_from_val is not None and break_to_val is not None and break_from_val < break_to_val:
+            fig, (ax_top, ax_main) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios': [1, 1]}) 
+            fig.subplots_adjust(hspace=0.1)  
+            ax_main.set_ylim(min(y_values_kcal) - 5, break_from_val); ax_top.set_ylim(break_to_val, max(y_values_kcal) + 5)    
+            ax_main.spines['top'].set_visible(False); ax_top.spines['bottom'].set_visible(False)
+            ax_top.tick_params(axis='x', which='both', bottom=False) 
+            d = .015  
+            kwargs_break = dict(transform=ax_main.transAxes, color='k', clip_on=False, linewidth=1)
+            ax_main.plot((-d, +d), (1 - d, 1 + d), **kwargs_break); ax_main.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs_break)  
+            kwargs_break.update(transform=ax_top.transAxes)
+            ax_top.plot((-d, +d), (0 - d, 0 + d), **kwargs_break); ax_top.plot((1 - d, 1 + d), (0 - d, 0 + d), **kwargs_break) 
+            marker_s = 25 if is_allxyz_plot else 20; marker_ew = 2 if is_allxyz_plot else 3
+            ax_main.plot(x_coords, y_values_kcal, marker='_', linestyle=line_style, color=line_color, markersize=marker_s, markeredgewidth=marker_ew, linewidth=line_width)
+            ax_top.plot(x_coords, y_values_kcal, marker='_', linestyle=line_style, color=line_color, markersize=marker_s, markeredgewidth=marker_ew, linewidth=line_width)
+            fig.text(0.02, 0.5, f"Relative {y_label_main} (kcal/mol)\n(Zeroed at: {ref_label_for_plot})", va='center', rotation='vertical', fontsize=10)
+            ax_main.set_xlabel("Reaction Coordinate" if not is_allxyz_plot else "Frame Number", fontsize=10)
+            for i, txt_val in enumerate(y_values_kcal):
+                label_text = f"{txt_val:.2f}"
+                if types_plotted_for_annotations and i < len(types_plotted_for_annotations): label_text += f"\n({types_plotted_for_annotations[i]})"
+                if y_values_kcal[i] <= break_from_val: ax_main.annotate(label_text, (x_coords[i], y_values_kcal[i]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
+                elif y_values_kcal[i] >= break_to_val: ax_top.annotate(label_text, (x_coords[i], y_values_kcal[i]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
+            ax_main.grid(axis='y', linestyle=':', alpha=0.8, color='gray'); ax_top.grid(axis='y', linestyle=':', alpha=0.8, color='gray')
+            ax_main.axhline(0, color='black', linewidth=0.5, linestyle='--') 
+            if 0 > break_to_val : ax_top.axhline(0, color='black', linewidth=0.5, linestyle='--')
+        else: 
+            fig, ax_main = plt.subplots(figsize=(max(7, len(x_labels) * 0.9), 6.5))
+            marker_s = 25 if is_allxyz_plot else 20; marker_ew = 2 if is_allxyz_plot else 3
+            ax_main.plot(x_coords, y_values_kcal, marker='_', linestyle=line_style, color=line_color, markersize=marker_s, markeredgewidth=marker_ew, linewidth=line_width)
+            ax_main.set_ylabel(f"Relative {y_label_main} (kcal/mol)\n(Zeroed at: {ref_label_for_plot})", fontsize=10)
+            ax_main.set_xlabel("Reaction Coordinate" if not is_allxyz_plot else "Frame Number", fontsize=10)
+            ax_main.grid(axis='y', linestyle=':', alpha=0.8, color='gray'); ax_main.axhline(0, color='black', linewidth=0.5, linestyle='--')
+            for i, txt_val in enumerate(y_values_kcal):
+                label_text = f"{txt_val:.2f}"
+                if types_plotted_for_annotations and i < len(types_plotted_for_annotations): label_text += f"\n({types_plotted_for_annotations[i]})"
+                ax_main.annotate(label_text, (x_coords[i], y_values_kcal[i]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
+
+        if ax_main is not None: 
+            ax_main.set_xticks(x_coords)
+            ax_main.set_xticklabels(x_labels, rotation=40, ha="right", fontsize=9)
+            if len(x_labels) > 20: ax_main.xaxis.set_major_locator(MaxNLocator(integer=True, prune='both', nbins=15))
+        plt.suptitle(title_text, fontsize=12, fontweight='bold')
+        plt.tight_layout(rect=[0.03, 0.03, 1, 0.95]) 
+        plt.show(block=False) 
+
+    def apply_treeview_row_tags(self, treeview_widget): 
+        children = treeview_widget.get_children(''); data_row_index = 0
+        for item_id in children:
+            cv = treeview_widget.item(item_id, 'values')
+            if cv and (cv[0] == "---" or cv[0] in ["Error", "Info"]):
+                if cv[0] == "---": treeview_widget.item(item_id, tags=('separator',))
+            else:
+                treeview_widget.item(item_id, tags=(self.row_tags[data_row_index % 2],))
+                data_row_index += 1
+
+    def copy_to_clipboard(self, data_string, success_message, error_message="Could not access clipboard.", parent_window=None):
+        if parent_window is None: parent_window = self.master
+        try:
+            self.master.clipboard_clear()
+            self.master.clipboard_append(data_string)
+            messagebox.showinfo("Clipboard", success_message, parent=parent_window)
+        except tk.TclError:
+            messagebox.showerror("Clipboard Error", error_message, parent=parent_window)
+
+    def call_parse_orca_thermo_block(self, filepath, app_instance=None):
+        """Allows modules to call the global parser through the app instance."""
+        # This ensures that 'self' from the module context (passed as app_instance here)
+        # is correctly passed to the global parsing function.
+        return parse_orca_thermo_block(filepath, app_instance=self if app_instance is None else app_instance)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ThermoApp(root)
+    root.mainloop()
+    
+    
